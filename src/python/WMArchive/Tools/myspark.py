@@ -35,6 +35,7 @@ import urllib2
 import httplib
 import argparse
 import datetime
+import subprocess
 
 # WMArchive modules
 import WMArchive
@@ -63,6 +64,8 @@ class OptionParser():
         msg = "Input schema, default %s/%s" % (hdir, schema)
         self.parser.add_argument("--schema", action="store",
             dest="schema", default="%s/%s" % (hdir, schema), help=msg)
+        self.parser.add_argument("--logfail", action="store_true",
+            dest="logfail", default=False, help="run a large query to locate the paths of logs of failing workflows")
         msg = "python script with custom mapper/reducer functions"
         self.parser.add_argument("--script", action="store",
             dest="script", default="", help=msg)
@@ -373,6 +376,145 @@ def scripts():
             print(fname.split('.py')[0])
             print(obj.__doc__)
 
+
+def runActionsHistoryQuery(schema_file, data_path, verbose=None, yarn=None):
+
+    """
+    Function to run a pyspark job to find the logs associated with the actionshistory.json file 
+    To run use a spec file with only timerange, e.g. "spec":{ "timerange":[20180706,20180706]}}
+    and then execute: myspark --spec=large_query.spec --logfail
+    """
+
+    if  verbose:
+        print("### schema: %s" % schema_file)
+        print("### path  : %s" % data_path)
+        print("### spec  : %s" % spec_file)
+    time0 = time.time()
+    # pyspark modules
+    from pyspark import SparkContext
+    from pyspark import SQLContext, StorageLevel
+
+    # define spark context, it's main object which allow
+    # to communicate with spark
+    ctx = SparkContext(appName="AvroKeyInputFormat")
+    logger = SparkLogger(ctx)
+    if  not verbose:
+        logger.set_level('ERROR')
+    if yarn:
+        logger.info("YARN client mode enabled")
+
+   
+    # load FWJR schema
+    rdd = ctx.textFile(schema_file, 1).collect()
+
+
+    # define input avro schema, the rdd is a list of lines (sc.textFile similar to readlines)
+    avsc = reduce(lambda x, y: x + y, rdd) # merge all entries from rdd list
+    schema = ''.join(avsc.split()) # remove spaces in avsc map
+    conf = {"avro.schema.input.key": schema}
+
+    # define newAPIHadoopFile parameters, java classes
+    aformat="org.apache.avro.mapreduce.AvroKeyInputFormat"
+    akey="org.apache.avro.mapred.AvroKey"
+    awrite="org.apache.hadoop.io.NullWritable"
+    aconv="org.apache.spark.examples.pythonconverters.AvroWrapperToJavaConverter"
+
+    # load data from HDFS
+    if  isinstance(data_path, list):
+        avro_rdd = ctx.union([ctx.newAPIHadoopFile(f, aformat, akey, awrite, aconv, conf=conf) for f in data_path])
+    else:
+        avro_rdd = ctx.newAPIHadoopFile(data_path, aformat, akey, awrite, aconv, conf=conf)
+
+    # load failing task 
+    rdd_failing_tasks = ctx.textFile("hdfs:///cms/users/llayer/failing_tasks.csv")
+    
+    #
+    # first step: filter the data for failing workflows and join with the actionshistory workflows
+    #
+
+    # filter the tasks - keep only failing that have a log file
+    def getFailing(row):
+        rec = row[0]
+        meta = rec.get('meta_data', {})
+        if meta.get('jobstate', '') != 'jobfailed':
+            return False
+        if rec.get('LFNArray', []) == []:
+            return False
+        return True
+
+    # create key-value structure for join
+    def avro_rdd_KV(row):
+        rec = row[0]
+        task = rec["task"]
+        return (task, rec)
+
+    # filter + join task names
+    fail_workflows = avro_rdd.filter(lambda x : getFailing(x)).map(lambda x : avro_rdd_KV(x)).join(rdd_failing_tasks.map(lambda x : (x,x)))
+
+    #
+    # second step: filter the data for logcollect tasks and join with the previous result
+    #
+
+    # keep only logcollect jobs
+    def filterLogCollect(row):
+        rec = row[0]
+        meta = rec.get('meta_data', {})
+        if  meta.get('jobtype', '').lower() != 'logcollect':
+            return False
+        return True
+
+    # create KV structure using log archive as key and return important information
+    def log_KV(row):
+        rec = row[1][0]
+        task = rec["task"]
+        lfn_array = rec.get('LFNArray', [])
+        meta = rec.get('meta_data', {})
+        jobstate = meta.get('jobstate', '') 
+        steps = rec.get('steps', [])
+        status = []
+        site = []
+        for step in steps:
+            status.append( step.get('status','') )
+            site.append( step.get('site','') )   
+        return [(lfn, {'task' : task, 'jobstate' : jobstate, 'status' : status, 'site' : site}) for lfn in lfn_array if 'logArch' in lfn]
+
+    # create KV structure for log collect jobs using log archives as keys
+    def logcoll_KV(row):
+        rec = row[0]
+        task = rec["task"]
+        lfn_array = rec.get('LFNArray', [])
+        logCollect = ""
+        for lfn in lfn_array:
+            if 'logcollect' in lfn.lower():
+                logCollect = lfn
+        meta = rec.get('meta_data', {})
+        jobstate = meta.get('jobstate', '') 
+        return [(lfn, {'logcollect_task' : task, 'logcollect_jobstate' : jobstate, 'logcollect_lfn' : logCollect}) for lfn in lfn_array if 'logArch' in lfn]
+
+    # log collect tasks
+    logColl = avro_rdd.filter(lambda x : filterLogCollect(x)).flatMap(lambda x : logcoll_KV(x))
+    
+    # join the frames with log archives as keys
+    result = fail_workflows.flatMap(lambda x : log_KV(x)).join(logColl)
+
+    # write back the records to hdfs
+    result.saveAsTextFile("hdfs:///cms/users/llayer/logs10.csv")
+    
+    ctx.stop()
+    if  verbose:
+        logger.info("Elapsed time %s" % htime(time.time()-time0))
+
+    return 0
+
+def run_cmd(args_list):
+        """
+        Run a shell command
+        """
+        proc = subprocess.Popen(args_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        s_output, s_err = proc.communicate()
+        s_return =  proc.returncode
+        return s_return, s_output, s_err  
+
 def main():
     "Main function"
     optmgr  = OptionParser()
@@ -408,48 +550,60 @@ def main():
             hdirs = []
             for tval in range_dates(timerange):
                 if  hdir.find(tval) == -1:
-                    hdirs.append(os.path.join(hdir, tval))
+                    hdfs_file_path = os.path.join(hdir, tval)
+                    # check whether the hdfs path exists
+                    cmd = ['hdfs', 'dfs', '-test', '-d', hdfs_file_path]
+                    ret, out, err = run_cmd(cmd)
+                    if ret == 0:
+                        hdirs.append(hdfs_file_path)
+                    else:
+                        print "Path does not exist:", hdfs_file_path
             hdir = hdirs
     if verbose:
         print("### HDIR: %s" % hdir)
-    results = run(opts.schema, hdir, opts.script, opts.spec, verbose, opts.rout, opts.yarn)
-    if  opts.store:
-        data = {"results":results,"ts":time.time(),"etime":time.time()-time0}
-        if  opts.wmaid:
-            data['wmaid'] = opts.wmaid
-        else:
-            data['wmaid'] = wmaHash(data)
-        data['dtype'] = 'job'
-        pdata = dict(job=data)
-        postdata(opts.store, pdata, opts.ckey, opts.cert, verbose)
-    elif opts.amq:
-        creds = credentials(opts.amq)
-        host, port = creds['host_and_ports'].split(':')
-        port = int(port)
-        if  creds and StompAMQ:
-            print("### Send %s docs via StompAMQ" % len(results))
-            amq = StompAMQ(creds['username'], creds['password'], \
-                    creds['producer'], creds['topic'], [(host, port)])
-            data = []
-            for doc in results:
-                hid = doc.get("hash", 1)
-                if '_id' in doc:
-                    del doc['_id'] # delete ObjectID from MongoDB
-                data.append(amq.make_notification(doc, hid))
-            results = amq.send(data)
-            print("### results from AMQ %s" % len(results))
+    if opts.logfail:
+        print "Start query"
+        runActionsHistoryQuery(opts.schema, hdir, verbose, opts.yarn)
+        print "Finish query"
     else:
-        if isinstance(results, list):
-            print("### number of results %s" % len(results))
-            for doc in results:
-                if '_id' in doc:
-                    del doc['_id'] # delete ObjectID from MongoDB
-                try:
-                    print(json.dumps(doc))
-                except:
-                    print(doc)
+        results = run(opts.schema, hdir, opts.script, opts.spec, verbose, opts.rout, opts.yarn)
+        if  opts.store:
+            data = {"results":results,"ts":time.time(),"etime":time.time()-time0}
+            if  opts.wmaid:
+                data['wmaid'] = opts.wmaid
+            else:
+                data['wmaid'] = wmaHash(data)
+            data['dtype'] = 'job'
+            pdata = dict(job=data)
+            postdata(opts.store, pdata, opts.ckey, opts.cert, verbose)
+        elif opts.amq:
+            creds = credentials(opts.amq)
+            host, port = creds['host_and_ports'].split(':')
+            port = int(port)
+            if  creds and StompAMQ:
+                print("### Send %s docs via StompAMQ" % len(results))
+                amq = StompAMQ(creds['username'], creds['password'], \
+                        creds['producer'], creds['topic'], [(host, port)])
+                data = []
+                for doc in results:
+                    hid = doc.get("hash", 1)
+                    if '_id' in doc:
+                        del doc['_id'] # delete ObjectID from MongoDB
+                    data.append(amq.make_notification(doc, hid))
+                results = amq.send(data)
+                print("### results from AMQ %s" % len(results))
         else:
-            print(results)
+            if isinstance(results, list):
+                print("### number of results %s" % len(results))
+                for doc in results:
+                    if '_id' in doc:
+                        del doc['_id'] # delete ObjectID from MongoDB
+                    try:
+                        print(json.dumps(doc))
+                    except:
+                        print(doc)
+            else:
+                print(results)
 
 if __name__ == '__main__':
     main()
