@@ -449,7 +449,9 @@ def runActionsHistoryQuery(schema_file, data_path, verbose=None, yarn=None):
         return (task, rec)
 
     # filter + join task names
-    fail_workflows = avro_rdd.filter(lambda x : getFailing(x)).map(lambda x : avro_rdd_KV(x)).join(rdd_failing_tasks.map(lambda x : (x,x)))
+    fail_workflows = avro_rdd.filter(lambda x : getFailing(x)) \
+                     .map(lambda x : avro_rdd_KV(x)) \
+                     .join(rdd_failing_tasks.map(lambda x : (x,x)))
 
     #
     # second step: filter the data for logcollect tasks and join with the previous result
@@ -475,8 +477,9 @@ def runActionsHistoryQuery(schema_file, data_path, verbose=None, yarn=None):
         site = []
         for step in steps:
             status.append( step.get('status','') )
-            site.append( step.get('site','') )   
-        return [(lfn, {'task' : task, 'jobstate' : jobstate, 'status' : status, 'site' : site}) for lfn in lfn_array if 'logArch' in lfn]
+            site.append( step.get('site','') )       
+        out_dict = {'task' : task, 'jobstate' : jobstate, 'status' : status, 'site' : site}
+        return [(lfn, out_dict) for lfn in lfn_array if 'logArch' in lfn]
 
     # create KV structure for log collect jobs using log archives as keys
     def logcoll_KV(row):
@@ -489,7 +492,8 @@ def runActionsHistoryQuery(schema_file, data_path, verbose=None, yarn=None):
                 logCollect = lfn
         meta = rec.get('meta_data', {})
         jobstate = meta.get('jobstate', '') 
-        return [(lfn, {'logcollect_task' : task, 'logcollect_jobstate' : jobstate, 'logcollect_lfn' : logCollect}) for lfn in lfn_array if 'logArch' in lfn]
+        out_dict = {'logcollect_task' : task, 'logcollect_jobstate' : jobstate, 'logcollect_lfn' : logCollect}
+        return [(lfn, out_dict) for lfn in lfn_array if 'logArch' in lfn]
 
     # log collect tasks
     logColl = avro_rdd.filter(lambda x : filterLogCollect(x)).flatMap(lambda x : logcoll_KV(x))
